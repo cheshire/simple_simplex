@@ -11,6 +11,7 @@ import logging
 l = logging.getLogger()
 l.setLevel(logging.DEBUG)
 
+EPSILON = 1e-10
 
 class LP_STATE(object):
     UNSOLVED = 0
@@ -21,33 +22,30 @@ class LP_STATE(object):
 def get_variable_assignments(pivoted_tableau, basis):
     """
     :param pivoted_tableau: Tableau on which `simplex` was already performed.
-    :param basis: Mapping row -> corresponding basis column.
+    :param basis: Mapping column -> corresponding basis row.
     """
 
     # Number of input variables.
     # Equals to length of the row, -1 for the constant, minus the number of
     # basic variables.
-    no_vars = len(pivoted_tableau) - 1 - len(basis)
+    no_vars = len(pivoted_tableau[0]) - 1 - len(basis)
 
-    # Change the basis mapping to column->row.
-    basis_map = {
-        basis_column: basis_row for (
-            basis_row, basis_column
-        ) in basis.itervalues()
-    }
     constants = pivoted_tableau[:, -1]
     def get_variable_value(idx):
-        if idx not in basis_map:
+        if idx not in basis:
+
+            # Nonbasic variable.
             return 0
         else:
-            return constants[basis_map[idx]]
+            return constants[basis[idx]]
 
     return map(get_variable_value, xrange(no_vars))
 
-def get_obj_value(pivoted_tableau):
+def get_obj_value(tableau):
     return - tableau[-1][-1]
 
 def two_phase_simplex(initial_constraints, objective_func):
+    logging.debug("Constraints: \n %s", initial_constraints)
 
     # Add auxilary variables.
     basis_size = len(initial_constraints)
@@ -62,10 +60,13 @@ def two_phase_simplex(initial_constraints, objective_func):
         axis=1,
     )
 
-    # Add an objective function.
-    tableau = np.append(
-        tableau,
-        objective_func + np.zeros(basis_size) + [0]
+    objective_row = np.concatenate(
+        (objective_func, np.zeros(basis_size), np.zeros(1)), axis=0
+    )
+
+    tableau = np.concatenate(
+        (tableau, [objective_row]),
+        axis=0
     )
 
     logging.debug("Generated initial tableau:\n %s", tableau)
@@ -77,6 +78,7 @@ def two_phase_simplex(initial_constraints, objective_func):
 
     if not has_negatives:
         basis = {i + no_nonbasic_vars: i for i in xrange(basis_size)}
+        logging.debug("Zero solution is feasible, running simplex")
         return simplex_pivoting(tableau, basis, False)
 
     ## Oh well. Now we have to construct an auxiliary tableau.
@@ -89,36 +91,65 @@ def two_phase_simplex(initial_constraints, objective_func):
         axis=1
     )
 
-    # Add an objective function.
-    aux_tableau = np.append(
-        aux_tableau,
-        [0] + objective_func + np.zeros(basis_size + 1)
-    )
+    # Except that the first one in the objective function is zero.
+    aux_tableau[-1][0] = 0
 
     # Add an objective function solving for x_0.
-    aux_tableau = np.append(
-        aux_tableau,
-        [-1] + np.zeros(len(objective_func) + basis_size + 1),
+    aux_tableau = np.concatenate(
+        (
+            aux_tableau,
+            [
+                np.concatenate(
+                    ([-1], np.zeros(len(objective_func) + basis_size + 1)),
+                )
+            ]
+        ),
+        axis=0
     )
+
+    logging.debug("Generated auxiliary tableau:\n %s", aux_tableau)
 
     # The first pivot is special, as we have to get into the feasible domain
     # first before we can run the simplex algorithm.
     first_pivot_row = constants.argmin()  # Index of the most -ve constant.
+
+    # column -> row
+    aux_basis = {
+        # +1 for the extra row for x_0.
+        i + no_nonbasic_vars + 1: i for i in xrange(basis_size)
+    }
+    logging.debug("initial basis is: %s", aux_basis)
+
     pivot(aux_tableau, first_pivot_row, 0)
-    basis[first_pivot_row] = 0
+
+    prev_basis_column = reverse_dict(aux_basis)[first_pivot_row]
+    aux_basis[0] = first_pivot_row
+    aux_basis.pop(prev_basis_column)
+
+    logging.debug("Auxiliary tableau after the first pivot:\n %s", aux_tableau)
 
     # Perform simplex on the auxiliary problem.
     aux_tableau, aux_basis, status = simplex_pivoting(
-        aux_tableau, basis, extra_obj_func=True
+        aux_tableau, aux_basis, extra_obj_func=True
     )
 
     # The problem is feasible if and only if auxiliary problem is optimal
     # on zero.
-    if not status == LP_STATE.OPTIMAL or get_obj_value(aux_tableau) != 0:
-        return (tableau, LP_STATE.UNFEASIBLE)
+    if not status == LP_STATE.OPTIMAL or abs(get_obj_value(aux_tableau)) > EPSILON:
+        logging.debug("After solving the auxiliary problem, status = %s", status)
+        logging.debug("Objective value = %s", get_obj_value(aux_tableau))
+        logging.debug("Auxiliary tableau is\n%s", aux_tableau)
+        return (tableau, aux_basis, LP_STATE.UNFEASIBLE)
+    logging.debug("Succesfully found the initial state, initializing LP")
+
+    # Convert the auxiliary basis to basis.
+    basis = {
+        column - 1: row for column, row in aux_basis.iteritems()
+    }
 
     # Cut the tableau out of auxiliary tableau.
-    tableau = aux_tableau[1::, :-1:]
+    tableau = aux_tableau[:-1:, 1::]
+    logging.debug("Extracted tableau: \n%s", tableau)
     return simplex_pivoting(
         tableau, basis, extra_obj_func=False
     )
@@ -131,11 +162,8 @@ def simplex_pivoting(tableau, basis, extra_obj_func=False):
             [objective func, <constant>]
         ]
         NOTE: the first implied column (0, 0, ..., -1) is NOT included.
-    :param basis: Mapping row -> corresponding basis column.
-        Note that size of basis is the number of rows in tableau
-        minus one (the objective function is not included).
-        Also note that the values of the `basis` dictionary give us the
-        simplex basis.
+    :param basis: Mapping column -> row containing "1".
+        Corresponds to columns in the simplex basis.
     """
     objective = tableau[-1]
     constraints = tableau[:-1]
@@ -143,11 +171,14 @@ def simplex_pivoting(tableau, basis, extra_obj_func=False):
     while True:
 
         # Find the first positive coefficient.
-        objective_pos_coeff = objective[objective > 0]
-        if len(objective_pos_coeff) > 0:
-            pivot_column = objective_pos_coeff[0]
-        else:
+        pivot_column = None
+        logging.debug("Objective = %s", objective)
+        for column_no, element in enumerate(objective):
+            if element > 0:
+                pivot_column = column_no
+                break
 
+        if pivot_column is None:
             # No positive coefficients: we have optimized the objective
             # function.
             break
@@ -159,25 +190,34 @@ def simplex_pivoting(tableau, basis, extra_obj_func=False):
 
         # Yes, it is "less", not "more", even we do get values which are
         # "more" then zero.
-        pos_ve_var_coeffs = np.ma.masked_less(var_coeffs, 0)
+        pos_ve_var_coeffs = np.ma.masked_array(
+            data=var_coeffs,
+            mask=var_coeffs<0,
+            fill_value=np.inf
+        )
+
         if extra_obj_func:
             # Mask second-last row: it's there only to contain a second
             # objective function.
-            pos_ve_var_coeffs.mask[-2] = True
+            pos_ve_var_coeffs.mask[-1] = True
 
         if pos_ve_var_coeffs.count() == 0:
 
             # No positive coefficients => unbounded.
-            return (tableau, LP_STATE.UNBOUNDED)
+            return (tableau, basis, LP_STATE.UNBOUNDED)
 
-        pivot_row = (pos_ve_var_coeffs / constants).argmin()
+        logging.debug("Raw var coeffs = %s", var_coeffs)
+        logging.debug("Fractions = %s", constants / pos_ve_var_coeffs)
+        pivot_row = (constants / pos_ve_var_coeffs).argmin()
 
         pivot(tableau, pivot_row, pivot_column)
 
         ## Update the basis status.
 
-        # Pivot column enters the basis, `basis[pivot_row]` leaves the basis.
-        basis[pivot_row] = pivot_column
+        # Pivot column enters the basis.
+        old_column = reverse_dict(basis)[pivot_row]
+        basis[pivot_column] = pivot_row
+        basis.pop(old_column)
 
     return (tableau, basis, LP_STATE.OPTIMAL)
 
@@ -185,14 +225,17 @@ def pivot(tableau, pivot_row, pivot_column):
     """
     Pivot the tableau on the given row and the given column.
     """
+    logging.debug("Pivoting on: row=%s, column=%s", pivot_row, pivot_column)
     # Make this entry equal to <one>.
     mult_coeff = 1 / tableau[pivot_row][pivot_column]
     tableau[pivot_row] *= mult_coeff
 
     # Make all other entries zero.
-    for row_idx in set(range(tableau)) - {pivot_row}:
+    for row_idx in set(xrange(len(tableau))) - {pivot_row}:
         multiplier = tableau[row_idx][pivot_column]
         tableau[row_idx] -= tableau[pivot_row] * multiplier
+
+    logging.debug("Tableau after pivot:\n%s", tableau)
 
 def optimize(lp_in):
     constraints, objective, used_vars = LP_from_stdin(
@@ -287,7 +330,7 @@ def LP_from_stdin(stdin, do_prompt=True):
         ] + [-get_constant_from_poly(c)] for c in constraints
     ]
 
-    return (np.array(constraints_matrix), np.array(objective_row), used_vars)
+    return (np.array(constraints_matrix), np.array(objective_row), map(str, used_vars))
 
 def get_coeff_from_poly(poly, var):
     """
@@ -295,14 +338,16 @@ def get_coeff_from_poly(poly, var):
     """
     if var not in poly.gens:
         return 0
-    return poly.coeff_monomial(var)
+    return float(poly.coeff_monomial(var))
 
 def get_constant_from_poly(poly):
     """
     Gets the constant value from the given polynomial.
     E. g. "3" for "3 + x - y"
     """
-    return poly.coeff_monomial(tuple(0 for i in xrange(len(poly.gens))))
+    return float(
+        poly.coeff_monomial(tuple(0 for i in xrange(len(poly.gens))))
+    )
 
 
 def parse_expr_and_transform(value):
@@ -315,6 +360,11 @@ def parse_expr_and_transform(value):
     return parse_expr(value, transformations=standard_transformations + (
         implicit_multiplication_application,)
     )
+
+def reverse_dict(d):
+    return {
+        v: k for k, v in d.iteritems()
+    }
 
 if __name__ == "__main__":
     main()

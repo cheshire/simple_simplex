@@ -8,7 +8,7 @@ class TestSolver(TestCase):
 x_1 - x_2 + x_3
 2x_1 - x_2 + 2x_3 <= 4
 2x_1 - 3x_2 + x_3 <= -5
--x_1 + x_2 - 2x_3 <= 1
+-x_1 + x_2 - 2x_3 <= -1
         """.strip()
 
         status, value, variables = optimize(LP)
